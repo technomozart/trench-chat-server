@@ -1,14 +1,20 @@
 {
   "name": "trench-chat-server",
-  "version": "1.0.0",
-  "description": "Socket.IO server for Trench Chat",
+  "version": "2.0.0",
+  "description": "Trench Chat server with auth, profiles, and referrals",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
     "express": "^4.18.2",
-    "socket.io": "^4.7.2"
+    "socket.io": "^4.6.1",
+    "cors": "^2.8.5",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.11.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
