@@ -579,7 +579,7 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
   });
-});
+}); 
 
 app.get("/", (req, res) => {
   res.send("Trench Chat Server Running");
