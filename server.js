@@ -582,10 +582,10 @@ io.on("connection", (socket) => {
 });
 
 app.get("/", (req, res) => {
-  res.send("Trench Chat Server v2.0 - With Auth, Points & Streaks");
+  res.send("Trench Chat Server Running");
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Trench Chat server running on port ${PORT}`);
 });
