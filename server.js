@@ -25,6 +25,29 @@ const pool = new Pool({
 // ===== JWT SECRET =====
 const JWT_SECRET = process.env.JWT_SECRET || 'trench-chat-secret-key-change-in-production';
 
+// ===== ADMIN CONFIG =====
+const SUPER_ADMIN = 'technomozart'; // Protected username
+
+// ===== SPECIAL ROOMS CONFIG =====
+const SPECIAL_ROOMS = {
+  GENERAL: 'GENERAL',
+  ANNOUNCEMENTS: 'ANNOUNCEMENTS'
+};
+
+// ===== REFERRAL BONUS CONFIG =====
+const REFERRAL_BONUS = {
+  INSTANT: 25,  // Points given immediately on registration with referral code
+  ON_VERIFICATION: 25  // Additional points when user gets verified
+};
+
+// ===== FLOOD CONTROL CONFIG =====
+const FLOOD_LIMITS = {
+  MAX_MESSAGES_PER_10S: 5,
+  MAX_LINKS_PER_MINUTE: 3,
+  MESSAGE_COOLDOWN_MS: 2000, // 2 seconds between messages
+  DUPLICATE_CHECK_WINDOW: 30000 // 30 seconds
+};
+
 // ===== POINTS CONFIG =====
 const POINTS = {
   MESSAGE: 1,
@@ -46,6 +69,11 @@ const STREAK_POINTS = [
   32, 35, 38, 41, 44, 45, 48, 51, 54, 58,
   62, 66, 70, 75, 80, 85, 90, 95, 100, 150
 ];
+
+// ===== IN-MEMORY FLOOD CONTROL =====
+const userMessageTracker = new Map(); // userId -> array of timestamps
+const userLinkTracker = new Map(); // userId -> array of link timestamps
+const recentMessages = new Map(); // userId -> array of recent message texts
 
 // ===== INITIALIZE DATABASE TABLES =====
 async function initDB() {
@@ -75,6 +103,9 @@ async function initDB() {
         rooms_messaged TEXT[] DEFAULT '{}',
         rooms_first_message TEXT[] DEFAULT '{}',
         is_verified BOOLEAN DEFAULT FALSE,
+        is_admin BOOLEAN DEFAULT FALSE,
+        is_blocked BOOLEAN DEFAULT FALSE,
+        muted_rooms TEXT[] DEFAULT '{}',
         last_message_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
@@ -118,12 +149,26 @@ async function initDB() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS moderation_log (
+        id SERIAL PRIMARY KEY,
+        admin_id INTEGER REFERENCES users(id),
+        target_user_id INTEGER REFERENCES users(id),
+        action VARCHAR(20) NOT NULL,
+        room VARCHAR(100),
+        reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE INDEX IF NOT EXISTS idx_messages_room ON messages(room);
       CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
       CREATE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code);
       CREATE INDEX IF NOT EXISTS idx_users_points ON users(total_points DESC);
       CREATE INDEX IF NOT EXISTS idx_chat_rooms_activity ON chat_rooms(last_activity DESC);
     `);
+    
+    // Set technomozart as admin if exists
+    await client.query(`UPDATE users SET is_admin = true WHERE LOWER(username) = LOWER($1)`, [SUPER_ADMIN]);
+    
     console.log("Database tables initialized");
   } catch (err) {
     console.error("Database init error:", err);
@@ -189,6 +234,79 @@ function authMiddleware(req, res, next) {
   }
 }
 
+async function adminMiddleware(req, res, next) {
+  try {
+    const result = await pool.query(`SELECT is_admin FROM users WHERE id = $1`, [req.user.id]);
+    if (result.rows.length === 0 || !result.rows[0].is_admin) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    next();
+  } catch (err) {
+    return res.status(500).json({ error: 'Authorization check failed' });
+  }
+}
+
+// ===== FLOOD CONTROL FUNCTIONS =====
+function checkFloodControl(userId, messageText) {
+  const now = Date.now();
+  
+  // Check message rate (5 messages per 10 seconds)
+  if (!userMessageTracker.has(userId)) {
+    userMessageTracker.set(userId, []);
+  }
+  const userMessages = userMessageTracker.get(userId);
+  const recentMessages = userMessages.filter(time => now - time < 10000);
+  
+  if (recentMessages.length >= FLOOD_LIMITS.MAX_MESSAGES_PER_10S) {
+    return { allowed: false, reason: 'Too many messages. Slow down!' };
+  }
+  
+  // Check for duplicate messages (within 30 seconds)
+  if (!recentMessages.has(userId)) {
+    recentMessages.set(userId, []);
+  }
+  const userRecentTexts = recentMessages.get(userId);
+  const duplicateCheck = userRecentTexts.find(msg => 
+    msg.text === messageText && now - msg.time < FLOOD_LIMITS.DUPLICATE_CHECK_WINDOW
+  );
+  
+  if (duplicateCheck) {
+    return { allowed: false, reason: 'Don\'t spam the same message!' };
+  }
+  
+  // Check link spam (max 3 links per minute)
+  const linkRegex = /(https?:\/\/[^\s]+)/g;
+  const links = (messageText.match(linkRegex) || []).length;
+  
+  if (links > 0) {
+    if (!userLinkTracker.has(userId)) {
+      userLinkTracker.set(userId, []);
+    }
+    const userLinks = userLinkTracker.get(userId);
+    const recentLinks = userLinks.filter(time => now - time < 60000); // Last minute
+    
+    if (recentLinks.length + links > FLOOD_LIMITS.MAX_LINKS_PER_MINUTE) {
+      return { allowed: false, reason: 'Too many links. Calm down!' };
+    }
+    
+    // Add new link timestamps
+    for (let i = 0; i < links; i++) {
+      recentLinks.push(now);
+    }
+    userLinkTracker.set(userId, recentLinks);
+  }
+  
+  // Update trackers
+  recentMessages.push(now);
+  userMessageTracker.set(userId, recentMessages);
+  
+  userRecentTexts.push({ text: messageText, time: now });
+  if (userRecentTexts.length > 10) userRecentTexts.shift(); // Keep last 10
+  recentMessages.set(userId, userRecentTexts);
+  
+  return { allowed: true };
+}
+
 // ===== AUTH ENDPOINTS =====
 app.post("/api/auth/register", async (req, res) => {
   const { username, email, password, referralCode } = req.body;
@@ -201,8 +319,14 @@ app.post("/api/auth/register", async (req, res) => {
   if (password.length < 6) {
     return res.status(400).json({ error: "Password must be at least 6 characters" });
   }
+  
+  // Check for protected username
+  if (username.toLowerCase() === SUPER_ADMIN.toLowerCase()) {
+    return res.status(400).json({ error: "This username is reserved" });
+  }
+  
   try {
-    const existing = await pool.query("SELECT id FROM users WHERE username = $1", [username.toLowerCase()]);
+    const existing = await pool.query("SELECT id FROM users WHERE LOWER(username) = LOWER($1)", [username]);
     if (existing.rows.length > 0) {
       return res.status(400).json({ error: "Username already taken" });
     }
@@ -213,17 +337,40 @@ app.post("/api/auth/register", async (req, res) => {
     }
     const passwordHash = await bcrypt.hash(password, 10);
     const newReferralCode = generateReferralCode();
+    
+    // Give instant referral bonus if code provided
+    const initialPoints = referrerId ? REFERRAL_BONUS.INSTANT : 0;
+    
     const result = await pool.query(
-      `INSERT INTO users (username, email, password_hash, referral_code, referred_by)
-       VALUES ($1, $2, $3, $4, $5) RETURNING id, username, referral_code, total_points, current_streak`,
-      [username.toLowerCase(), email || null, passwordHash, newReferralCode, referrerId]
+      `INSERT INTO users (username, email, password_hash, referral_code, referred_by, total_points)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, username, referral_code, total_points, current_streak, is_admin`,
+      [username.toLowerCase(), email || null, passwordHash, newReferralCode, referrerId, initialPoints]
     );
     const user = result.rows[0];
+    
     if (referrerId) {
       await pool.query(`INSERT INTO referrals (referrer_id, referred_user_id, status) VALUES ($1, $2, 'pending')`, [referrerId, user.id]);
+      // Log the instant bonus
+      await pool.query(
+        `INSERT INTO points_log (user_id, action, points, details) VALUES ($1, $2, $3, $4)`,
+        [user.id, 'REFERRAL_BONUS_INSTANT', REFERRAL_BONUS.INSTANT, `Used referral code`]
+      );
     }
+    
     const token = generateToken(user);
-    res.json({ token, user: { id: user.id, username: user.username, referralCode: user.referral_code, total_points: user.total_points, current_streak: user.current_streak } });
+    res.json({ 
+      token, 
+      user: { 
+        id: user.id, 
+        username: user.username, 
+        referralCode: user.referral_code, 
+        total_points: user.total_points, 
+        current_streak: user.current_streak, 
+        is_admin: user.is_admin 
+      },
+      referralBonusApplied: !!referrerId,
+      bonusPoints: initialPoints
+    });
   } catch (err) {
     console.error("Register error:", err);
     res.status(500).json({ error: "Registration failed" });
@@ -236,7 +383,7 @@ app.post("/api/auth/login", async (req, res) => {
     return res.status(400).json({ error: "Username and password required" });
   }
   try {
-    const result = await pool.query("SELECT * FROM users WHERE username = $1", [username.toLowerCase()]);
+    const result = await pool.query("SELECT * FROM users WHERE LOWER(username) = LOWER($1)", [username]);
     if (result.rows.length === 0) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
@@ -245,6 +392,12 @@ app.post("/api/auth/login", async (req, res) => {
     if (!validPassword) {
       return res.status(401).json({ error: "Invalid credentials" });
     }
+    
+    // Check if blocked
+    if (user.is_blocked) {
+      return res.status(403).json({ error: "Your account has been blocked" });
+    }
+    
     await checkDailyReset(user.id);
     const token = generateToken(user);
     res.json({
@@ -252,7 +405,8 @@ app.post("/api/auth/login", async (req, res) => {
       user: {
         id: user.id, username: user.username, avatar_url: user.avatar_url, bio: user.bio,
         sol_wallet: user.sol_wallet, referralCode: user.referral_code, message_count: user.message_count,
-        total_points: user.total_points, current_streak: user.current_streak, last_checkin: user.last_checkin, is_verified: user.is_verified
+        total_points: user.total_points, current_streak: user.current_streak, last_checkin: user.last_checkin, 
+        is_verified: user.is_verified, is_admin: user.is_admin, is_blocked: user.is_blocked, muted_rooms: user.muted_rooms
       }
     });
   } catch (err) {
@@ -267,7 +421,8 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
     const result = await pool.query(
       `SELECT id, username, email, avatar_url, bio, sol_wallet, referral_code, 
               message_count, total_points, daily_points, current_streak, longest_streak,
-              last_checkin, is_verified, created_at, daily_messages, daily_rooms_joined, daily_reactions_received
+              last_checkin, is_verified, is_admin, is_blocked, muted_rooms, created_at, 
+              daily_messages, daily_rooms_joined, daily_reactions_received
        FROM users WHERE id = $1`,
       [req.user.id]
     );
@@ -276,6 +431,149 @@ app.get("/api/auth/me", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("Get user error:", err);
     res.status(500).json({ error: "Failed to get user" });
+  }
+});
+
+// ===== MODERATION ENDPOINTS =====
+app.post("/api/admin/mute", authMiddleware, adminMiddleware, async (req, res) => {
+  const { username, room } = req.body;
+  if (!username || !room) {
+    return res.status(400).json({ error: "Username and room required" });
+  }
+  
+  try {
+    const result = await pool.query(
+      `UPDATE users SET muted_rooms = array_append(muted_rooms, $1) 
+       WHERE LOWER(username) = LOWER($2) AND NOT ($1 = ANY(muted_rooms))
+       RETURNING id, username, muted_rooms`,
+      [room, username]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found or already muted in this room" });
+    }
+    
+    // Log moderation action
+    await pool.query(
+      `INSERT INTO moderation_log (admin_id, target_user_id, action, room) VALUES ($1, $2, 'mute', $3)`,
+      [req.user.id, result.rows[0].id, room]
+    );
+    
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    console.error("Mute error:", err);
+    res.status(500).json({ error: "Failed to mute user" });
+  }
+});
+
+app.post("/api/admin/unmute", authMiddleware, adminMiddleware, async (req, res) => {
+  const { username, room } = req.body;
+  if (!username || !room) {
+    return res.status(400).json({ error: "Username and room required" });
+  }
+  
+  try {
+    const result = await pool.query(
+      `UPDATE users SET muted_rooms = array_remove(muted_rooms, $1) 
+       WHERE LOWER(username) = LOWER($2)
+       RETURNING id, username, muted_rooms`,
+      [room, username]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    await pool.query(
+      `INSERT INTO moderation_log (admin_id, target_user_id, action, room) VALUES ($1, $2, 'unmute', $3)`,
+      [req.user.id, result.rows[0].id, room]
+    );
+    
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    console.error("Unmute error:", err);
+    res.status(500).json({ error: "Failed to unmute user" });
+  }
+});
+
+app.post("/api/admin/block", authMiddleware, adminMiddleware, async (req, res) => {
+  const { username } = req.body;
+  if (!username) {
+    return res.status(400).json({ error: "Username required" });
+  }
+  
+  // Can't block admins
+  const targetUser = await pool.query(`SELECT id, is_admin FROM users WHERE LOWER(username) = LOWER($1)`, [username]);
+  if (targetUser.rows.length === 0) {
+    return res.status(404).json({ error: "User not found" });
+  }
+  if (targetUser.rows[0].is_admin) {
+    return res.status(403).json({ error: "Cannot block admin users" });
+  }
+  
+  try {
+    const result = await pool.query(
+      `UPDATE users SET is_blocked = true WHERE LOWER(username) = LOWER($1) RETURNING id, username, is_blocked`,
+      [username]
+    );
+    
+    await pool.query(
+      `INSERT INTO moderation_log (admin_id, target_user_id, action) VALUES ($1, $2, 'block')`,
+      [req.user.id, result.rows[0].id]
+    );
+    
+    // Disconnect user's socket if online
+    io.emit('user_blocked', { username: result.rows[0].username });
+    
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    console.error("Block error:", err);
+    res.status(500).json({ error: "Failed to block user" });
+  }
+});
+
+app.post("/api/admin/unblock", authMiddleware, adminMiddleware, async (req, res) => {
+  const { username } = req.body;
+  if (!username) {
+    return res.status(400).json({ error: "Username required" });
+  }
+  
+  try {
+    const result = await pool.query(
+      `UPDATE users SET is_blocked = false WHERE LOWER(username) = LOWER($1) RETURNING id, username, is_blocked`,
+      [username]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    await pool.query(
+      `INSERT INTO moderation_log (admin_id, target_user_id, action) VALUES ($1, $2, 'unblock')`,
+      [req.user.id, result.rows[0].id]
+    );
+    
+    res.json({ success: true, user: result.rows[0] });
+  } catch (err) {
+    console.error("Unblock error:", err);
+    res.status(500).json({ error: "Failed to unblock user" });
+  }
+});
+
+app.get("/api/admin/logs", authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT ml.*, u1.username as admin_username, u2.username as target_username
+      FROM moderation_log ml
+      JOIN users u1 ON ml.admin_id = u1.id
+      JOIN users u2 ON ml.target_user_id = u2.id
+      ORDER BY ml.created_at DESC
+      LIMIT 100
+    `);
+    res.json({ logs: result.rows });
+  } catch (err) {
+    console.error("Get logs error:", err);
+    res.status(500).json({ error: "Failed to get logs" });
   }
 });
 
@@ -370,8 +668,8 @@ app.get("/api/points", authMiddleware, async (req, res) => {
 
 app.get("/api/leaderboard", async (req, res) => {
   try {
-    const pointsLb = await pool.query(`SELECT username, avatar_url, total_points, current_streak FROM users WHERE total_points > 0 ORDER BY total_points DESC LIMIT 200`);
-    const referralsLb = await pool.query(`SELECT u.username, u.avatar_url, COUNT(r.id) as referral_count FROM users u LEFT JOIN referrals r ON r.referrer_id = u.id AND r.status = 'verified' GROUP BY u.id HAVING COUNT(r.id) > 0 ORDER BY referral_count DESC LIMIT 200`);
+    const pointsLb = await pool.query(`SELECT username, avatar_url, total_points, current_streak, is_admin FROM users WHERE total_points > 0 ORDER BY total_points DESC LIMIT 200`);
+    const referralsLb = await pool.query(`SELECT u.username, u.avatar_url, u.is_admin, COUNT(r.id) as referral_count FROM users u LEFT JOIN referrals r ON r.referrer_id = u.id AND r.status = 'verified' GROUP BY u.id HAVING COUNT(r.id) > 0 ORDER BY referral_count DESC LIMIT 200`);
     res.json({ pointsLeaderboard: pointsLb.rows, referralsLeaderboard: referralsLb.rows });
   } catch (err) {
     console.error("Leaderboard error:", err);
@@ -385,7 +683,7 @@ app.put("/api/profile", authMiddleware, async (req, res) => {
   try {
     const result = await pool.query(
       `UPDATE users SET avatar_url = COALESCE($1, avatar_url), bio = COALESCE($2, bio), sol_wallet = COALESCE($3, sol_wallet) WHERE id = $4
-       RETURNING id, username, avatar_url, bio, sol_wallet, referral_code, message_count, total_points, current_streak, is_verified`,
+       RETURNING id, username, avatar_url, bio, sol_wallet, referral_code, message_count, total_points, current_streak, is_verified, is_admin`,
       [avatar_url, bio, sol_wallet, req.user.id]
     );
     res.json({ user: result.rows[0] });
@@ -398,8 +696,8 @@ app.put("/api/profile", authMiddleware, async (req, res) => {
 app.get("/api/profile/:username", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, username, avatar_url, bio, message_count, total_points, current_streak, longest_streak, is_verified, created_at FROM users WHERE username = $1`,
-      [req.params.username.toLowerCase()]
+      `SELECT id, username, avatar_url, bio, message_count, total_points, current_streak, longest_streak, is_verified, is_admin, created_at FROM users WHERE LOWER(username) = LOWER($1)`,
+      [req.params.username]
     );
     if (result.rows.length === 0) return res.status(404).json({ error: "User not found" });
     const refCount = await pool.query(`SELECT COUNT(*) as count FROM referrals WHERE referrer_id = $1 AND status = 'verified'`, [result.rows[0].id]);
@@ -425,7 +723,7 @@ app.get("/api/referrals", authMiddleware, async (req, res) => {
 
 app.get("/api/referrals/leaderboard", async (req, res) => {
   try {
-    const result = await pool.query(`SELECT u.username, u.avatar_url, COUNT(r.id) as referral_count FROM users u LEFT JOIN referrals r ON r.referrer_id = u.id AND r.status = 'verified' GROUP BY u.id HAVING COUNT(r.id) > 0 ORDER BY referral_count DESC LIMIT 200`);
+    const result = await pool.query(`SELECT u.username, u.avatar_url, u.is_admin, COUNT(r.id) as referral_count FROM users u LEFT JOIN referrals r ON r.referrer_id = u.id AND r.status = 'verified' GROUP BY u.id HAVING COUNT(r.id) > 0 ORDER BY referral_count DESC LIMIT 200`);
     res.json({ leaderboard: result.rows });
   } catch (err) {
     console.error("Leaderboard error:", err);
@@ -461,6 +759,7 @@ io.on("connection", (socket) => {
   console.log("User connected:", socket.id);
   let currentUserId = null;
   let currentUsername = null;
+  let isAdmin = false;
 
   socket.on("authenticate", async (token) => {
     try {
@@ -469,10 +768,26 @@ io.on("connection", (socket) => {
       currentUsername = decoded.username;
       socket.userId = decoded.id;
       socket.username = decoded.username;
+      
+      // Check if user is blocked or admin
+      const userCheck = await pool.query(`SELECT is_blocked, is_admin FROM users WHERE id = $1`, [currentUserId]);
+      if (userCheck.rows.length === 0) {
+        socket.emit('auth_failed', 'User not found');
+        return;
+      }
+      if (userCheck.rows[0].is_blocked) {
+        socket.emit('blocked', 'Your account has been blocked');
+        socket.disconnect();
+        return;
+      }
+      isAdmin = userCheck.rows[0].is_admin;
+      socket.isAdmin = isAdmin;
+      
       await checkDailyReset(currentUserId);
-      console.log("Socket authenticated:", decoded.username);
+      console.log("Socket authenticated:", decoded.username, isAdmin ? "(Admin)" : "");
     } catch (err) {
-      console.log("Socket auth failed");
+      console.log("Socket auth failed:", err.message);
+      socket.emit('auth_failed', 'Invalid token');
     }
   });
 
@@ -502,15 +817,46 @@ io.on("connection", (socket) => {
   });
 
   socket.on("send_message", async ({ room, message }) => {
+    // Check if user is blocked
+    if (currentUserId) {
+      const blockCheck = await pool.query(`SELECT is_blocked, muted_rooms, is_admin FROM users WHERE id = $1`, [currentUserId]);
+      if (blockCheck.rows[0].is_blocked) {
+        socket.emit("message_error", "You have been blocked from chatting");
+        return;
+      }
+      
+      // Check if muted in this room
+      if (blockCheck.rows[0].muted_rooms && blockCheck.rows[0].muted_rooms.includes(room)) {
+        socket.emit("message_error", "You have been muted in this room");
+        return;
+      }
+      
+      // Check if trying to post in ANNOUNCEMENTS without being admin
+      if (room.toUpperCase() === SPECIAL_ROOMS.ANNOUNCEMENTS && !blockCheck.rows[0].is_admin) {
+        socket.emit("message_error", "Only admins can post announcements");
+        return;
+      }
+    }
+    
+    // Flood control
+    if (currentUserId && message.text) {
+      const floodCheck = checkFloodControl(currentUserId, message.text);
+      if (!floodCheck.allowed) {
+        socket.emit("message_error", floodCheck.reason);
+        return;
+      }
+    }
+    
     let canEarnPoints = true;
     if (currentUserId) {
       const lastMsg = await pool.query(`SELECT last_message_at FROM users WHERE id = $1`, [currentUserId]);
       if (lastMsg.rows[0].last_message_at) {
         const timeDiff = Date.now() - new Date(lastMsg.rows[0].last_message_at).getTime();
-        if (timeDiff < 10000) canEarnPoints = false;
+        if (timeDiff < FLOOD_LIMITS.MESSAGE_COOLDOWN_MS) canEarnPoints = false;
       }
       if (!message.text || message.text.trim().length < 3) canEarnPoints = false;
     }
+    
     const msgData = { id: Date.now().toString(), user: message.user, text: message.text || null, image: message.image || null, reactions: {}, time: Date.now() };
     try {
       const result = await pool.query(`INSERT INTO messages (room, user_id, username, text, image) VALUES ($1, $2, $3, $4, $5) RETURNING id`, [room, currentUserId || null, message.user, message.text || null, message.image || null]);
@@ -531,10 +877,16 @@ io.on("connection", (socket) => {
           await pool.query(`UPDATE users SET daily_messages = daily_messages + 1 WHERE id = $1`, [currentUserId]);
           if (isFirstMessage) await awardPoints(currentUserId, 'FIRST_MESSAGE_IN_ROOM', POINTS.FIRST_MESSAGE_IN_ROOM, room);
         }
-        const verifyCheck = await pool.query(`SELECT message_count, array_length(rooms_messaged, 1) as room_count, is_verified FROM users WHERE id = $1`, [currentUserId]);
+        const verifyCheck = await pool.query(`SELECT message_count, array_length(rooms_messaged, 1) as room_count, is_verified, referred_by FROM users WHERE id = $1`, [currentUserId]);
         const verifyData = verifyCheck.rows[0];
         if (!verifyData.is_verified && verifyData.message_count >= 5 && verifyData.room_count >= 2) {
           await pool.query(`UPDATE users SET is_verified = TRUE WHERE id = $1`, [currentUserId]);
+          
+          // Award verification bonus if user was referred
+          if (verifyData.referred_by) {
+            await awardPoints(currentUserId, 'REFERRAL_BONUS_VERIFIED', REFERRAL_BONUS.ON_VERIFICATION, 'Got verified with referral');
+          }
+          
           const refResult = await pool.query(`UPDATE referrals SET status = 'verified', verified_at = CURRENT_TIMESTAMP WHERE referred_user_id = $1 AND status = 'pending' RETURNING referrer_id`, [currentUserId]);
           if (refResult.rows.length > 0) {
             await awardPoints(refResult.rows[0].referrer_id, 'VERIFIED_REFERRAL', POINTS.VERIFIED_REFERRAL, currentUsername);
