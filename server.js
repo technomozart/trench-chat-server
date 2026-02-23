@@ -255,9 +255,9 @@ function checkFloodControl(userId, messageText) {
     userMessageTracker.set(userId, []);
   }
   const userMessages = userMessageTracker.get(userId);
-  const recentMessages = userMessages.filter(time => now - time < 10000);
+  const recentMsgs = userMessages.filter(time => now - time < 10000);
   
-  if (recentMessages.length >= FLOOD_LIMITS.MAX_MESSAGES_PER_10S) {
+  if (recentMsgs.length >= FLOOD_LIMITS.MAX_MESSAGES_PER_10S) {
     return { allowed: false, reason: 'Too many messages. Slow down!' };
   }
   
