@@ -299,8 +299,8 @@ function checkFloodControl(userId, messageText) {
   }
   
   // Update trackers
-  recentMessages.push(now);
-  userMessageTracker.set(userId, recentMessages);
+  recentMsgs.push(now);
+  userMessageTracker.set(userId, recentMsgs);
   
   userRecentTexts.push({ text: messageText, time: now });
   if (userRecentTexts.length > 10) userRecentTexts.shift(); // Keep last 10
