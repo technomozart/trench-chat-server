@@ -821,24 +821,24 @@ io.on("connection", (socket) => {
   });
 
   socket.on("send_message", async ({ room, message }) => {
-    // Check if user is blocked
+    // Quick checks before sending
     if (currentUserId) {
-      const blockCheck = await pool.query(`SELECT is_blocked, muted_rooms, is_admin FROM users WHERE id = $1`, [currentUserId]);
-      if (blockCheck.rows[0].is_blocked) {
-        socket.emit("message_error", "You have been blocked from chatting");
-        return;
-      }
-      
-      // Check if muted in this room
-      if (blockCheck.rows[0].muted_rooms && blockCheck.rows[0].muted_rooms.includes(room)) {
-        socket.emit("message_error", "You have been muted in this room");
-        return;
-      }
-      
-      // Check if trying to post in ANNOUNCEMENTS without being admin
-      if (room.toUpperCase() === SPECIAL_ROOMS.ANNOUNCEMENTS && !blockCheck.rows[0].is_admin) {
-        socket.emit("message_error", "Only admins can post announcements");
-        return;
+      try {
+        const blockCheck = await pool.query(`SELECT is_blocked, muted_rooms, is_admin FROM users WHERE id = $1`, [currentUserId]);
+        if (blockCheck.rows[0].is_blocked) {
+          socket.emit("message_error", "You have been blocked from chatting");
+          return;
+        }
+        if (blockCheck.rows[0].muted_rooms && blockCheck.rows[0].muted_rooms.includes(room)) {
+          socket.emit("message_error", "You have been muted in this room");
+          return;
+        }
+        if (room.toUpperCase() === SPECIAL_ROOMS.ANNOUNCEMENTS && !blockCheck.rows[0].is_admin) {
+          socket.emit("message_error", "Only admins can post announcements");
+          return;
+        }
+      } catch (err) {
+        console.error("Block check error:", err);
       }
     }
     
@@ -851,22 +851,35 @@ io.on("connection", (socket) => {
       }
     }
     
-    let canEarnPoints = true;
-    if (currentUserId) {
-      const lastMsg = await pool.query(`SELECT last_message_at FROM users WHERE id = $1`, [currentUserId]);
-      if (lastMsg.rows[0].last_message_at) {
-        const timeDiff = Date.now() - new Date(lastMsg.rows[0].last_message_at).getTime();
-        if (timeDiff < FLOOD_LIMITS.MESSAGE_COOLDOWN_MS) canEarnPoints = false;
-      }
-      if (!message.text || message.text.trim().length < 3) canEarnPoints = false;
-    }
-    
+    // Build message and EMIT IMMEDIATELY
     const msgData = { id: Date.now().toString(), user: message.user, text: message.text || null, image: message.image || null, reactions: {}, time: Date.now() };
+    
+    // Save to DB and get real ID
     try {
       const result = await pool.query(`INSERT INTO messages (room, user_id, username, text, image) VALUES ($1, $2, $3, $4, $5) RETURNING id`, [room, currentUserId || null, message.user, message.text || null, message.image || null]);
       msgData.id = result.rows[0].id.toString();
-      await pool.query(`UPDATE chat_rooms SET message_count = message_count + 1, last_activity = CURRENT_TIMESTAMP WHERE ca = $1`, [room]);
-      if (currentUserId) {
+    } catch (err) {
+      console.error("Save message error:", err);
+    }
+    
+    // Broadcast to everyone in room NOW
+    io.to(room).emit("receive_message", msgData);
+    
+    // Do all the points/stats stuff in the background (don't block messaging)
+    (async () => {
+      try {
+        await pool.query(`UPDATE chat_rooms SET message_count = message_count + 1, last_activity = CURRENT_TIMESTAMP WHERE ca = $1`, [room]);
+        
+        if (!currentUserId) return;
+        
+        let canEarnPoints = true;
+        const lastMsg = await pool.query(`SELECT last_message_at FROM users WHERE id = $1`, [currentUserId]);
+        if (lastMsg.rows[0].last_message_at) {
+          const timeDiff = Date.now() - new Date(lastMsg.rows[0].last_message_at).getTime();
+          if (timeDiff < FLOOD_LIMITS.MESSAGE_COOLDOWN_MS) canEarnPoints = false;
+        }
+        if (!message.text || message.text.trim().length < 3) canEarnPoints = false;
+        
         const userCheck = await pool.query(`SELECT rooms_messaged, rooms_first_message, daily_messages FROM users WHERE id = $1`, [currentUserId]);
         const userData = userCheck.rows[0];
         const isNewRoom = !userData.rooms_messaged.includes(room);
@@ -876,31 +889,29 @@ io.on("connection", (socket) => {
         if (isFirstMessage) updateQuery += `, rooms_first_message = array_append(rooms_first_message, '${room}')`;
         updateQuery += ` WHERE id = ${currentUserId}`;
         await pool.query(updateQuery);
+        
         if (canEarnPoints && userData.daily_messages < DAILY_LIMITS.MESSAGES) {
           await awardPoints(currentUserId, 'MESSAGE', POINTS.MESSAGE, room);
           await pool.query(`UPDATE users SET daily_messages = daily_messages + 1 WHERE id = $1`, [currentUserId]);
           if (isFirstMessage) await awardPoints(currentUserId, 'FIRST_MESSAGE_IN_ROOM', POINTS.FIRST_MESSAGE_IN_ROOM, room);
         }
+        
         const verifyCheck = await pool.query(`SELECT message_count, array_length(rooms_messaged, 1) as room_count, is_verified, referred_by FROM users WHERE id = $1`, [currentUserId]);
         const verifyData = verifyCheck.rows[0];
         if (!verifyData.is_verified && verifyData.message_count >= 5 && verifyData.room_count >= 2) {
           await pool.query(`UPDATE users SET is_verified = TRUE WHERE id = $1`, [currentUserId]);
-          
-          // Award verification bonus if user was referred
           if (verifyData.referred_by) {
             await awardPoints(currentUserId, 'REFERRAL_BONUS_VERIFIED', REFERRAL_BONUS.ON_VERIFICATION, 'Got verified with referral');
           }
-          
           const refResult = await pool.query(`UPDATE referrals SET status = 'verified', verified_at = CURRENT_TIMESTAMP WHERE referred_user_id = $1 AND status = 'pending' RETURNING referrer_id`, [currentUserId]);
           if (refResult.rows.length > 0) {
             await awardPoints(refResult.rows[0].referrer_id, 'VERIFIED_REFERRAL', POINTS.VERIFIED_REFERRAL, currentUsername);
           }
         }
+      } catch (err) {
+        console.error("Background points error:", err);
       }
-    } catch (err) {
-      console.error("Save message error:", err);
-    }
-    io.to(room).emit("receive_message", msgData);
+    })();
   });
 
   socket.on("add_reaction", async ({ room, msgId, emoji, user }) => {
