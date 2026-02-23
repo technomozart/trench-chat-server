@@ -13,7 +13,10 @@ app.use(express.json({ limit: '10mb' }));
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" }
+  cors: { origin: "*" },
+  transports: ['websocket', 'polling'],
+  pingTimeout: 60000,
+  pingInterval: 25000
 });
 
 // ===== DATABASE CONNECTION =====
@@ -785,6 +788,7 @@ io.on("connection", (socket) => {
       
       await checkDailyReset(currentUserId);
       console.log("Socket authenticated:", decoded.username, isAdmin ? "(Admin)" : "");
+      socket.emit('authenticated', { username: decoded.username, isAdmin });
     } catch (err) {
       console.log("Socket auth failed:", err.message);
       socket.emit('auth_failed', 'Invalid token');
