@@ -813,6 +813,10 @@ io.on("connection", (socket) => {
       const result = await pool.query(`SELECT id, username, text, image, reactions, created_at as time FROM messages WHERE room = $1 ORDER BY created_at DESC LIMIT 50`, [ca]);
       const messages = result.rows.reverse().map(m => ({ id: m.id.toString(), user: m.username, text: m.text, image: m.image, reactions: m.reactions || {}, time: new Date(m.time).getTime() }));
       socket.emit("chat_history", messages);
+      // Send online count to everyone in room
+      const room = io.sockets.adapter.rooms.get(ca);
+      const onlineCount = room ? room.size : 1;
+      io.to(ca).emit("online_count", onlineCount);
     } catch (err) {
       console.error("Join room error:", err);
       socket.emit("chat_history", []);
@@ -944,6 +948,16 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
+    // Update online count for all rooms this socket was in
+    if (socket.rooms) {
+      socket.rooms.forEach(room => {
+        if (room !== socket.id) {
+          const roomData = io.sockets.adapter.rooms.get(room);
+          const onlineCount = roomData ? roomData.size : 0;
+          io.to(room).emit("online_count", onlineCount);
+        }
+      });
+    }
   });
 }); 
 
